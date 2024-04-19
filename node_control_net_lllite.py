@@ -5,11 +5,11 @@ import os
 import comfy
 
 CURRENT_DIR = os.path.dirname(os.path.realpath(__file__))
+CATEGORY_NAME = "controlnet_lllite/"
 
 
 def get_file_list(path):
     return [file for file in os.listdir(path) if file != "put_models_here.txt"]
-
 
 def extra_options_to_module_prefix(extra_options):
     # extra_options = {'transformer_index': 2, 'block_index': 8, 'original_shape': [2, 4, 128, 128], 'block': ('input', 7), 'n_heads': 20, 'dim_head': 64}
@@ -33,96 +33,37 @@ def extra_options_to_module_prefix(extra_options):
         raise Exception("invalid block name")
     return module_pfx
 
+class LLLitePatch:
+    def __init__(self, modules, sigma_low, sigma_high, attn):
+        self.modules = modules
+        self.sigma_low = sigma_low
+        self.sigma_high = sigma_high
+        self.attn = attn
 
-def load_control_net_lllite_patch(path, cond_image, multiplier, num_steps, start_percent, end_percent):
-    # calculate start and end step
-    start_step = math.floor(num_steps * start_percent * 0.01) if start_percent > 0 else 0
-    end_step = math.floor(num_steps * end_percent * 0.01) if end_percent > 0 else num_steps
+    def __call__(self, q, k, v, extra_options):
+        sigma = extra_options["sigmas"][0].item()
+        cond_or_uncond = extra_options["cond_or_uncond"]
 
-    # load weights
-    ctrl_sd = comfy.utils.load_torch_file(path, safe_load=True)
+        if self.sigma_low <= sigma <= self.sigma_high:
+            module_pfx = extra_options_to_module_prefix(extra_options) + self.attn
+            if module_pfx + "_to_q" in self.modules:
+                q = q + self.modules[module_pfx + "_to_q"](q, cond_or_uncond)
+            if module_pfx + "_to_k" in self.modules:
+                k = k + self.modules[module_pfx + "_to_k"](k, cond_or_uncond)
+            if module_pfx + "_to_v" in self.modules:
+                v = v + self.modules[module_pfx + "_to_v"](v, cond_or_uncond)
 
-    # split each weights for each module
-    module_weights = {}
-    for key, value in ctrl_sd.items():
-        fragments = key.split(".")
-        module_name = fragments[0]
-        weight_name = ".".join(fragments[1:])
-
-        if module_name not in module_weights:
-            module_weights[module_name] = {}
-        module_weights[module_name][weight_name] = value
-
-    # load each module
-    modules = {}
-    for module_name, weights in module_weights.items():
-        # ここの自動判定を何とかしたい
-        if "conditioning1.4.weight" in weights:
-            depth = 3
-        elif weights["conditioning1.2.weight"].shape[-1] == 4:
-            depth = 2
-        else:
-            depth = 1
-
-        module = LLLiteModule(
-            name=module_name,
-            is_conv2d=weights["down.0.weight"].ndim == 4,
-            in_dim=weights["down.0.weight"].shape[1],
-            depth=depth,
-            cond_emb_dim=weights["conditioning1.0.weight"].shape[0] * 2,
-            mlp_dim=weights["down.0.weight"].shape[0],
-            multiplier=multiplier,
-            num_steps=num_steps,
-            start_step=start_step,
-            end_step=end_step,
-        )
-        info = module.load_state_dict(weights)
-        modules[module_name] = module
-        if len(modules) == 1:
-            module.is_first = True
-
-    print(f"loaded {path} successfully, {len(modules)} modules")
-
-    # cond imageをセットする
-    cond_image = cond_image.permute(0, 3, 1, 2)  # b,h,w,3 -> b,3,h,w
-    cond_image = cond_image * 2.0 - 1.0  # 0-1 -> -1-+1
-
-    for module in modules.values():
-        module.set_cond_image(cond_image)
-
-    class control_net_lllite_patch:
-        def __init__(self, modules):
-            self.modules = modules
-
-        def __call__(self, q, k, v, extra_options):
-            module_pfx = extra_options_to_module_prefix(extra_options)
-
-            is_attn1 = q.shape[-1] == k.shape[-1]  # self attention
-            if is_attn1:
-                module_pfx = module_pfx + "_attn1"
-            else:
-                module_pfx = module_pfx + "_attn2"
-
-            module_pfx_to_q = module_pfx + "_to_q"
-            module_pfx_to_k = module_pfx + "_to_k"
-            module_pfx_to_v = module_pfx + "_to_v"
-
-            if module_pfx_to_q in self.modules:
-                q = q + self.modules[module_pfx_to_q](q)
-            if module_pfx_to_k in self.modules:
-                k = k + self.modules[module_pfx_to_k](k)
-            if module_pfx_to_v in self.modules:
-                v = v + self.modules[module_pfx_to_v](v)
-
-            return q, k, v
-
-        def to(self, device):
-            for d in self.modules.keys():
-                self.modules[d] = self.modules[d].to(device)
-            return self
-
-    return control_net_lllite_patch(modules)
-
+        return q, k, v
+    
+    def to(self, device):
+        if hasattr(torch, "float8_e4m3fn") and device == torch.float8_e4m3fn:
+            device = torch.float16 # or bfloat16?
+        if hasattr(torch, "float8_e5m2") and device == torch.float8_e5m2:
+            device = torch.float16
+        
+        for d in self.modules.keys():
+            self.modules[d] = self.modules[d].to(device)
+        return self
 
 class LLLiteModule(torch.nn.Module):
     def __init__(
@@ -133,18 +74,10 @@ class LLLiteModule(torch.nn.Module):
         depth: int,
         cond_emb_dim: int,
         mlp_dim: int,
-        multiplier: int,
-        num_steps: int,
-        start_step: int,
-        end_step: int,
     ):
         super().__init__()
         self.name = name
         self.is_conv2d = is_conv2d
-        self.multiplier = multiplier
-        self.num_steps = num_steps
-        self.start_step = start_step
-        self.end_step = end_step
         self.is_first = False
 
         modules = []
@@ -190,100 +123,157 @@ class LLLiteModule(torch.nn.Module):
             )
 
         self.depth = depth
-        self.cond_image = None
-        self.cond_emb = None
-        self.current_step = 0
 
-    # @torch.inference_mode()
-    def set_cond_image(self, cond_image):
-        # print("set_cond_image", self.name)
-        self.cond_image = cond_image
-        self.cond_emb = None
-        self.current_step = 0
+    def set_cond(self, positive, negative):
+        self.positive = positive
+        self.negative = negative
+        self.cond_emb = []
 
-    def forward(self, x):
-        if self.num_steps > 0:
-            if self.current_step < self.start_step:
-                self.current_step += 1
-                return torch.zeros_like(x)
-            elif self.current_step >= self.end_step:
-                if self.is_first and self.current_step == self.end_step:
-                    print(f"end LLLite: step {self.current_step}")
-                self.current_step += 1
-                if self.current_step >= self.num_steps:
-                    self.current_step = 0  # reset
-                return torch.zeros_like(x)
-            else:
-                if self.is_first and self.current_step == self.start_step:
-                    print(f"start LLLite: step {self.current_step}")
-                self.current_step += 1
-                if self.current_step >= self.num_steps:
-                    self.current_step = 0  # reset
+    def forward(self, x, cond_or_uncond=[0, 1]):
 
-        if self.cond_emb is None:
+        if self.cond_emb == []:
             # print(f"cond_emb is None, {self.name}")
-            cx = self.conditioning1(self.cond_image.to(x.device, dtype=x.dtype))
-            if not self.is_conv2d:
-                # reshape / b,c,h,w -> b,h*w,c
-                n, c, h, w = cx.shape
-                cx = cx.view(n, c, h * w).permute(0, 2, 1)
-            self.cond_emb = cx
+            self.cond_emb = []
+            for cond_image in [self.positive["cond_image"], self.negative["cond_image"]]:
+                cx = self.conditioning1(cond_image.to(x.device, dtype=x.dtype))
+                if not self.is_conv2d:
+                    # reshape / b,c,h,w -> b,h*w,c
+                    n, c, h, w = cx.shape
+                    cx = cx.view(n, c, h * w).permute(0, 2, 1)
+                self.cond_emb.append(cx)
 
-        cx = self.cond_emb
-        # print(f"forward {self.name}, {cx.shape}, {x.shape}")
+        multiplier = [self.positive["strength"], self.negative["strength"]]
+        multipliers = torch.tensor([multiplier[i] for i in cond_or_uncond], device=x.device, dtype=x.dtype)
 
-        # uncond/condでxはバッチサイズが2倍
-        if x.shape[0] != cx.shape[0]:
-            if self.is_conv2d:
-                cx = cx.repeat(x.shape[0] // cx.shape[0], 1, 1, 1)
-            else:
-                # print("x.shape[0] != cx.shape[0]", x.shape[0], cx.shape[0])
-                cx = cx.repeat(x.shape[0] // cx.shape[0], 1, 1)
+        if self.is_conv2d:
+            multipliers = multipliers.view(-1, 1, 1, 1)
+        else:
+            multipliers = multipliers.view(-1, 1, 1)
 
+        # multiplierが0の要素は計算省略したい気がするけど・・・めんどくさい
+        cx = torch.cat([self.cond_emb[i] for i in cond_or_uncond])
         cx = torch.cat([cx, self.down(x)], dim=1 if self.is_conv2d else 2)
         cx = self.mid(cx)
         cx = self.up(cx)
-        return cx * self.multiplier
+        return cx * multipliers
 
-
-class LLLiteLoader:
-    def __init__(self):
-        pass
+class LLLiteModelLoader:
 
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "model": ("MODEL",),
                 "model_name": (get_file_list(os.path.join(CURRENT_DIR, "models")),),
+            }
+        }
+
+    RETURN_TYPES = ("LLLITE_MODEL",)
+    FUNCTION = "load_lllite"
+    CATEGORY = CATEGORY_NAME + "LLLiteModelLoader"
+
+    def load_lllite(self, model_name):
+        model_path = os.path.join(CURRENT_DIR, os.path.join(CURRENT_DIR, "models", model_name))
+        ctrl_sd = comfy.utils.load_torch_file(model_path, safe_load=True)
+        
+        # split each weights for each module
+        module_weights = {}
+        for key, value in ctrl_sd.items():
+            fragments = key.split(".")
+            module_name = fragments[0]
+            weight_name = ".".join(fragments[1:])
+
+            if module_name not in module_weights:
+                module_weights[module_name] = {}
+            module_weights[module_name][weight_name] = value
+
+        # load each module
+        modules_attn1 = {}
+        modules_attn2 = {}
+        for module_name, weights in module_weights.items():
+            # ここの自動判定を何とかしたい
+            if "conditioning1.4.weight" in weights:
+                depth = 3
+            elif weights["conditioning1.2.weight"].shape[-1] == 4:
+                depth = 2
+            else:
+                depth = 1
+
+            module = LLLiteModule(
+                name=module_name,
+                is_conv2d=weights["down.0.weight"].ndim == 4,
+                in_dim=weights["down.0.weight"].shape[1],
+                depth=depth,
+                cond_emb_dim=weights["conditioning1.0.weight"].shape[0] * 2,
+                mlp_dim=weights["down.0.weight"].shape[0],
+            )
+            info = module.load_state_dict(weights)
+            if "attn1" in module_name:
+                modules_attn1[module_name] = module
+            else:
+                modules_attn2[module_name] = module
+        
+        return ((modules_attn1, modules_attn2), )
+    
+class LLLiteConditioning:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
                 "cond_image": ("IMAGE",),
                 "strength": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.01}),
-                "steps": ("INT", {"default": 0, "min": 0, "max": 200, "step": 1}),
+            }
+        }
+
+    RETURN_TYPES = ("LLLITE_CONDITIONING",)
+    FUNCTION = "load_conditioning"
+    CATEGORY = CATEGORY_NAME + "LLLiteConditioning"
+
+    def load_conditioning(self, cond_image, strength):
+        cond_image = cond_image.permute(0, 3, 1, 2)  # b,h,w,3 -> b,3,h,w
+        cond_image = cond_image * 2.0 - 1.0  # 0-1 -> -1-+1
+        return ({'cond_image': cond_image, 'strength': strength},)
+
+class LLLiteApply:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "model": ("MODEL",),
+                "lllite_model": ("LLLITE_MODEL",),
+                "positive": ("LLLITE_CONDITIONING",),
+                "negative": ("LLLITE_CONDITIONING",),
                 "start_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1}),
-                "end_percent": ("FLOAT", {"default": 0.0, "min": 0.0, "max": 100.0, "step": 0.1}),
+                "end_percent": ("FLOAT", {"default": 100.0, "min": 0.0, "max": 100.0, "step": 0.1}),
             }
         }
 
     RETURN_TYPES = ("MODEL",)
-    FUNCTION = "load_lllite"
-    CATEGORY = "loaders"
+    FUNCTION = "apply"
+    CATEGORY = CATEGORY_NAME + "LLLiteApply"
 
-    def load_lllite(self, model, model_name, cond_image, strength, steps, start_percent, end_percent):
-        # cond_image is b,h,w,3, 0-1
+    def apply(self, model, lllite_model, positive, negative, start_percent, end_percent):
+        sigma_high = model.model.model_sampling.percent_to_sigma(start_percent / 100)
+        sigma_low = model.model.model_sampling.percent_to_sigma(end_percent / 100)
 
-        model_path = os.path.join(CURRENT_DIR, os.path.join(CURRENT_DIR, "models", model_name))
+        new_model = model.clone()
+        for modules in lllite_model:
+            for module in modules.values():
+                module.set_cond(positive, negative)
 
-        model_lllite = model.clone()
-        patch = load_control_net_lllite_patch(model_path, cond_image, strength, steps, start_percent, end_percent)
-        if patch is not None:
-            model_lllite.set_model_attn1_patch(patch)
-            model_lllite.set_model_attn2_patch(patch)
+        new_model.set_model_attn1_patch(LLLitePatch(lllite_model[0], sigma_low, sigma_high, "_attn1"))
+        new_model.set_model_attn2_patch(LLLitePatch(lllite_model[1], sigma_low, sigma_high, "_attn2"))
 
-        return (model_lllite,)
+        return (new_model,)
 
 
-NODE_CLASS_MAPPINGS = {"LLLiteLoader": LLLiteLoader}
+NODE_CLASS_MAPPINGS = {
+    "LLLiteModelLoader": LLLiteModelLoader, 
+    "LLLiteConditioning": LLLiteConditioning, 
+    "LLLiteApply": LLLiteApply
+}
 
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "LLLiteLoader": "Load LLLite",
+    "LLLiteModelLoader": "LLLite Model Loader", 
+    "LLLiteConditioning": "LLLite Conditioning", 
+    "LLLiteApply": "LLLite Apply"
 }
